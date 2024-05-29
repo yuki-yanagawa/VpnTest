@@ -16,6 +16,14 @@
 #define IPPROTO_ICMP 1
 #endif
 
+#ifndef ETHER_IP_PROTOCOL
+#define ETHER_IP_PROTOCOL 0x0800
+#endif
+
+#ifndef ETHER_ARP_PROTOCOL
+#define ETHER_ARP_PROTOCOL 0x0806
+#endif
+
 typedef struct {
     uint8_t vhl;
     uint8_t tos;
