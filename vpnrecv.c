@@ -11,6 +11,8 @@
 #include<arpa/inet.h>
 #include<poll.h>
 #include<netpacket/packet.h>
+#include<net/route.h>
+#include<sys/wait.h>
 
 #include "netutil.h"
 
@@ -22,9 +24,16 @@
 #define ETHNIC_IP_ADDR "192.168.80.1"
 #define ETHNIC_NETMASK "255.255.255.0"
 
+#define RTDST "192.168.80.0"
+#define RTGATEWAY "192.168.50.1"
+#define RTGENMASK "255.255.255.0"
+
 #define READ_BUF_SIZE 2048
 
+#define DEBUG_ON
+
 int virnic_fd;
+int neworkAddr[3];
 
 static int virnicOpen() {
     virnic_fd = open("/dev/net/tun", O_RDWR);
@@ -139,6 +148,109 @@ static int ethNicSetting() {
     return 0;
 }
 
+static void routeSetting() {
+    struct rtentry route;
+    struct sockaddr_in *addr;
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    memset(&route, 0, sizeof(route));
+
+    addr = (struct sockaddr_in*)&route.rt_dst;
+    addr->sin_family = AF_INET;
+    addr->sin_addr.s_addr = inet_addr(RTDST);
+
+    addr = (struct sockaddr_in*)&route.rt_gateway;
+    addr->sin_family = AF_INET;
+    addr->sin_addr.s_addr = inet_addr(RTGATEWAY);
+
+    addr = (struct sockaddr_in*)&route.rt_genmask;
+    addr->sin_family = AF_INET;
+    addr->sin_addr.s_addr = inet_addr(RTGENMASK);
+
+    route.rt_flags = RTF_UP | RTF_GATEWAY;
+    route.rt_dev = "sampletun0";
+    route.rt_metric = 100;
+
+    /* Add the route */
+    if(ioctl(fd, SIOCADDRT, route) != 0) {
+        perror("error");
+        exit(-1);
+    }
+    sleep(30);
+    ioctl(fd, SIOCDELRT, route);
+}
+
+static void getVirNicNetWorkAddr(int* retNetWorkAddr) {
+    char del = '.';
+    char buf[3];
+    int index;
+    char* p = VIRNIC_IP_ADDR;
+    int* retP = retNetWorkAddr;
+
+    memset(buf,0,sizeof(buf));
+    index = 0;
+    while(*p != del) {
+        buf[index++] = *p++;
+    }
+    buf[index] = '\0';
+    *retP++ = atoi(buf);
+    //skip '.'
+    p++;
+
+    memset(buf,0,sizeof(buf));
+    index = 0;
+    while(*p != del) {
+        buf[index++] = *p++;
+    }
+    buf[index] = '\0';
+    *retP++ = atoi(buf);
+    //skip '.'
+    p++;
+
+    memset(buf,0,sizeof(buf));
+    index = 0;
+    while(*p != del) {
+        buf[index++] = *p++;
+    }
+    buf[index] = '\0';
+    *retP++ = atoi(buf);
+    //skip '.'
+    p++;
+}
+
+static bool checkNetWork(uint32_t ipaddr) {
+    return (ipaddr >> 24 & 0xff) == neworkAddr[0] && (ipaddr >> 16 & 0xff) == neworkAddr[1] && (ipaddr >> 8 & 0xff) == neworkAddr[2];
+}
+
+static void ipforwardSettingON() {
+    pid_t pid = fork();
+    if(pid == 0) {
+        char* execargv[] ={"/sbin/sysctl", "-w", "net.ipv4.ip_forward=1", NULL};
+        execve("/sbin/sysctl", execargv, NULL);
+    }
+    int status = 0;
+    wait(&status);
+    if(status != 0) {
+        perror("ipforward setting error....");
+        exit(1);
+    }
+}
+
+static void ipforwardSettingOFF() {
+    pid_t pid = fork();
+    if(pid == 0) {
+        char* execargv[] ={"/sbin/sysctl", "-w", "net.ipv4.ip_forward=0", NULL};
+        execve("/sbin/sysctl", execargv, NULL);
+    }
+    int status = 0;
+    wait(&status);
+    if(status != 0) {
+        perror("ipforward setting error....");
+        exit(1);
+    }
+}
+
 int main(int argc, char* argv) {
     if(virnicOpen() != 0) {
         exit(1);
@@ -151,6 +263,17 @@ int main(int argc, char* argv) {
     if(ethNicSetting() != 0) {
         exit(1);
     }
+
+    // routeSetting();
+
+    ipforwardSettingON();
+
+    //virnicNetWorkAddrSetting
+    memset(neworkAddr, 0, sizeof(neworkAddr));
+    getVirNicNetWorkAddr(neworkAddr);
+#ifdef DEBUG_ON
+    printf("Net work addr %d.%d.%d\n", neworkAddr[0], neworkAddr[1], neworkAddr[2]);
+#endif
 
     int ethsock = socket(PF_PACKET, SOCK_RAW, swapon16(ETH_P_ALL));
     if(ethsock < 0) {
@@ -189,25 +312,35 @@ int main(int argc, char* argv) {
     while(1) {
         memset(buf, 0, sizeof(buf));
         poll(pfd, 2, -1);
-        if(pfd[1].revents & POLLIN) {
-            readSize = read(pfd[1].fd, buf, sizeof(buf));
-            printf("eth nic get\n");
-            ETHHDR* ep = (ETHHDR*)buf;
-            printf("protocol 0x%x\n", swapon16(ep->protocol));
-            
-            IPHDR* eip = (IPHDR*)(buf + sizeof(ETHHDR));
-            printIpAddr(eip);
-            write(pfd[0].fd, (char*)(buf + sizeof(ETHHDR)), readSize - sizeof(ETHHDR));
-            // iphp = (IPHDR*)buf;
-            // printIpAddr(iphp);
-        }
         if(pfd[0].revents & POLLIN) {
             readSize = read(pfd[0].fd, buf, sizeof(buf));
             iphp = (IPHDR*)buf;
-            printIpAddr(iphp);
+            if(checkNetWork(swapon32(iphp->destip))) {
+                printf("****** vir nic *******\n");
+                printIpAddr(iphp);
+                printf("****** vir nic *******\n");
+                printf("\n");
+            }
+        }
+        if(pfd[1].revents & POLLIN) {
+            readSize = read(pfd[1].fd, buf, sizeof(buf));
+            // printf("eth nic get\n");
+            ETHHDR* ep = (ETHHDR*)buf;
+            // printf("protocol 0x%x\n", swapon16(ep->protocol));
+            if(swapon16(ep->protocol) == ETHER_IP_PROTOCOL) {
+                IPHDR* eip = (IPHDR*)(buf + sizeof(ETHHDR));
+                if(checkNetWork(swapon32(eip->destip))) {
+                    printf("****** eth nic *******\n");
+                    printIpAddr(eip);
+                    printf("****** eth nic *******\n");
+                    printf("\n");
+                    write(pfd[0].fd, (char*)(buf + sizeof(ETHHDR)), readSize - sizeof(ETHHDR));
+                }
+            }
         }
     }
     
+    ipforwardSettingOFF();
     close(virnic_fd);
     return 0;
 }
